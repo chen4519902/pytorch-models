@@ -1,4 +1,138 @@
+import datetime
+import torch
+import torch.nn as nn
+import logging
+import pandas as pd
+import numpy as np
+import torch.nn.functional as F
+from collections import defaultdict
+from .metrics import NDCG
 from argparse import ArgumentParser, ArgumentTypeError
+
+logging.basicConfig()
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+
+def cur_time():
+    return datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+
+def get_device():
+    if torch.cuda.is_available():
+        device = "cuda:{}".format(np.random.randint(torch.cuda.device_count()))
+    else:
+        device = "cpu"
+    logger.info("use device: {}".format(device))
+    return device
+
+
+def init_weights(m):
+    if type(m) == nn.Linear:
+        nn.init.xavier_uniform_(m.weight)
+        m.bias.data.fill_(0.01)
+
+
+def eval_ndcg_at_k(
+        inference_model,
+        device,
+        df_valid,
+        valid_loader,
+        batch_size,
+        k_list,
+        epoch,
+        writer=None,
+        phase="Eval"
+):
+    # print("Eval Phase evaluate NDCG @ {}".format(k_list))
+    ndcg_metrics = {k: NDCG(k) for k in k_list}
+    qids, rels, scores = [], [], []
+    inference_model.eval()
+    with torch.no_grad():
+        for qid, rel, x in valid_loader.generate_batch(df_valid, batch_size):
+            if x is None or x.shape[0] == 0:
+                continue
+            y_tensor = inference_model.forward(torch.Tensor(x).to(device))
+            scores.append(y_tensor.cpu().numpy().squeeze())
+            qids.append(qid)
+            rels.append(rel)
+
+    qids = np.hstack(qids)
+    rels = np.hstack(rels)
+    scores = np.hstack(scores)
+    result_df = pd.DataFrame({'qid': qids, 'rel': rels, 'score': scores})
+    session_ndcgs = defaultdict(list)
+    for qid in result_df.qid.unique():
+        result_qid = result_df[result_df.qid == qid].sort_values('score', ascending=False)
+        rel_rank = result_qid.rel.values
+        for k, ndcg in ndcg_metrics.items():
+            if ndcg.maxDCG(rel_rank) == 0:
+                continue
+            ndcg_k = ndcg.evaluate(rel_rank)
+            if not np.isnan(ndcg_k):
+                session_ndcgs[k].append(ndcg_k)
+
+    ndcg_result = {k: np.mean(session_ndcgs[k]) for k in k_list}
+    ndcg_result_print = ", ".join(["NDCG@{}: {:.5f}".format(k, ndcg_result[k]) for k in k_list])
+    logger.info(cur_time() + " {} Phase evaluate {}".format(phase, ndcg_result_print))
+    if writer:
+        for k in k_list:
+            writer.add_scalars("metrics/NDCG@{}".format(k), {phase: ndcg_result[k]}, epoch)
+    return ndcg_result
+
+
+def eval_cross_entropy_loss(
+        model, device, loader,
+        epoch, writer=None,
+        phase="Eval", sigma=1.0
+):
+    """
+    formula in https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/MSR-TR-2010-82.pdf
+    """
+    logger.info(cur_time() + "{} Phase evaluate pairwise cross entropy loss".format(phase))
+    model.eval()
+    with torch.set_grad_enabled(False):
+        total_cost = 0
+        total_pairs = loader.get_num_pairs()
+        pairs_in_compute = 0
+        for X, Y in loader.process_query_batch(loader.df):
+            Y = Y.reshape(-1, 1)
+            rel_diff = Y - Y.T
+            pos_pairs = (rel_diff > 0).astype(np.float32)
+            num_pos_pairs = np.sum(pos_pairs, (0, 1))
+            if num_pos_pairs == 0:
+                continue
+            neg_pairs = (rel_diff < 0).astype(np.float32)
+            num_pairs = 2 * num_pos_pairs  # num pos pairs and neg pairs are always the same
+            pos_pairs = torch.tensor(pos_pairs, device=device)
+            neg_pairs = torch.tensor(neg_pairs, device=device)
+            Sij = pos_pairs - neg_pairs
+            # only calculate the different pairs
+            diff_pairs = pos_pairs + neg_pairs
+            pairs_in_compute += num_pairs
+
+            X_tensor = torch.Tensor(X).to(device)
+            y_pred = model(X_tensor)
+            y_pred_diff = y_pred - y_pred.t()
+
+            # logsigmoid(x) = log(1 / (1 + exp(-x))) equivalent to log(1 + exp(-x))
+            C = 0.5 * (1 - Sij) * sigma * y_pred_diff - F.logsigmoid(-sigma * y_pred_diff)
+            C = C * diff_pairs
+            cost = torch.sum(C, (0, 1))
+            if cost.item() == float('inf') or np.isnan(cost.item()):
+                import ipdb
+                ipdb.set_trace()
+            total_cost += cost
+
+        assert total_pairs == pairs_in_compute
+        avg_cost = total_cost / total_pairs
+    logger.info(
+        cur_time() +
+        "Epoch {}: {} Phase pairwise corss entropy loss {:.6f}, total_paris {}".format(
+            epoch, phase, avg_cost.item(), total_pairs
+        ))
+    if writer:
+        writer.add_scalars('loss/cross_entropy', {phase: avg_cost.item()}, epoch)
 
 
 def get_args_parser():
